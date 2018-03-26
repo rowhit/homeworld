@@ -23,6 +23,7 @@ all: PyYAML-${PYYAML_VER}.tar.gz
 all: qemu-2.11.0.tar.xz
 RKT_VER=1.29.0
 all: rkt-${RKT_VER}.tar.xz
+all: rktlet-ceb68df20290a95ad718ee9ecd7f6d359b79fc15.tar.xz
 
 .PHONY: verify just-verify
 just-verify:
@@ -331,3 +332,9 @@ PyYAML-${PYYAML_VER}.tar.gz: https/pypi.python.org/packages/4a/85/db5a2df477072b
 qemu-%.tar.xz: https/download.qemu.org/qemu-2.11.0.tar.xz https/download.qemu.org/qemu-2.11.0.tar.xz.sig keys/qemu.ring
 	$(call gpg-verify,$<,.sig,qemu)
 	@cp $< $@
+
+# **** rktlet ****
+
+rktlet-%.tar: git/kubernetes-incubator/rktlet
+	# no verification required, because this is essentially pinning to a specific hash
+	$(call git-archive,$(@:rktlet-%.tar=%),kubernetes-incubator/rktlet,$(@:%.tar=%/),$@)
