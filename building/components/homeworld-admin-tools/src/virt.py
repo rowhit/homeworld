@@ -1,9 +1,16 @@
+import atexit
+import hashlib
 import os
 import subprocess
 import tempfile
+import threading
+import time
 
+import access
 import command
 import configuration
+import infra
+import seq
 
 
 def get_bridge(ip):
@@ -162,13 +169,172 @@ def net_down(fail=False):
 
     ok &= bridge_down(bridge_name, gateway_ip)
 
-    if not ok:
+    if not ok and fail:
         command.fail("tearing down network failed (maybe it was already torn down?)")
+    return ok
 
 
-main_command = command.mux_map("commands to run local testing VMs", {
+def call_on_existence(path, callback):
+    def wait_for_existence():
+        # TODO: don't busywait
+        while not os.path.exists(path):
+            time.sleep(0.2)
+        callback()
+    threading.Thread(target=wait_for_existence, daemon=True).start()
+
+
+# TODO: refactor
+def call_transactive(args, text, delay, output_callback, output_to, kill_path):
+    assert not (output_callback and output_to)
+    if output_to:
+        stdout_target = open(output_to, "wb")
+    elif output_callback:
+        stdout_target = subprocess.PIPE
+    else:
+        stdout_target = None
+    if text:
+        stdin_target = subprocess.PIPE
+    elif kill_path is not None:
+        stdin_target = subprocess.DEVNULL
+    else:
+        stdin_target = None
+    keep_output_alive = False
+    p = subprocess.Popen(args, stdin=stdin_target, stdout=stdout_target)
+    try:
+        atexit.register(p.kill)
+        if kill_path is not None:
+            def check_path():
+                p.wait()
+                if os.path.exists(kill_path):
+                    os.remove(kill_path)
+                if output_to:
+                    if not keep_output_alive:
+                        stdout_target.close()
+                elif p.stdout:
+                    p.stdout.close()
+                if p.stdin:
+                    p.stdin.close()
+            threading.Thread(target=check_path, daemon=True).start()
+            call_on_existence(kill_path, p.terminate)
+        if text is not None:
+            time.sleep(delay)
+            p.stdin.write(text.encode() + b"\n")
+            p.stdin.flush()
+        if output_callback is not None:
+            while True:
+                line = p.stdout.readline()
+                if not line: break
+                if output_callback(line): break
+            # TODO: what if the buffer fills up?
+        if kill_path is None:
+            return p.wait()
+        keep_output_alive = True
+    finally:
+        if output_to:
+            if not keep_output_alive:
+                stdout_target.close()
+        elif p.stdout:
+            p.stdout.close()
+        if p.stdin:
+            p.stdin.close()
+
+
+def qemu_raw(hd, cd=None, cpus=12, mem=2500, netif=None, input=None, input_delay=None, output_callback=None, output_to=None, kill_path=None):
+    # TODO: don't blindly load kvm-intel; check type of system first
+    sudo("modprobe", "kvm", "kvm-intel")
+
+    args = ["qemu-system-x86_64"]
+    args += ["-nographic", "-serial", "mon:stdio"]
+    args += ["-machine", "accel=kvm", "-cpu", "host"]
+    args += ["-hda", hd]
+    if cd is None:
+        args += ["-boot", "c"]
+    else:
+        args += ["-cdrom", cd]
+        args += ["-boot", "d"]
+    args += ["-no-reboot"]
+    args += ["-smp", "%d" % int(cpus), "-m", "%d" % int(mem)]
+    if netif is None:
+        args += ["-net", "none"]
+    else:
+        digest = hashlib.sha256(netif.encode()).hexdigest()[-6:]
+        macaddr = "52:54:00:%s:%s:%s" % (digest[0:2], digest[2:4], digest[4:6])
+        args += ["-net", "nic,macaddr=%s" % macaddr, "-net", "tap,ifname=%s,script=no,downscript=no" % netif]
+    rc = call_transactive(args, input, input_delay, output_callback, output_to, kill_path)
+    if rc:
+        command.fail("qemu virtual machine failed")
+
+
+def get_disk_path(node):
+    return os.path.join(configuration.get_project(), "virt-local", "disk-%s.qcow2" % node.hostname)
+
+
+def qemu_install(node_name, iso_path, bootstrap_token, disk_gb=25, visible="show"):
+    assert disk_gb > 0
+    if bootstrap_token == "auto-admit":
+        bootstrap_token = infra.admit(node_name)
+    assert not any(c.isspace() for c in bootstrap_token)
+    node = configuration.get_config().get_node(node_name)
+    disk = get_disk_path(node)
+    if os.path.exists(disk):
+        os.remove(disk)
+    if not os.path.isdir(os.path.dirname(disk)):
+        os.makedirs(os.path.dirname(disk))
+    subprocess.check_call(["qemu-img", "create", "-f", "qcow2", "--", disk, "%uG" % int(disk_gb)])
+    # TODO: do something better than a two-second delay to detect "boot:" prompt
+    bootline = "install netcfg/get_ipaddress=%s homeworld/asktoken=%s" % (node.ip, bootstrap_token)
+    qemu_raw(disk, iso_path, netif=get_node_tap(node), input=bootline, input_delay=2.0, output_to=(None if visible == "show" else "log.%s.install" % node.hostname))
+
+
+def qemu_launch(node_name, kill_path=None):
+    node = configuration.get_config().get_node(node_name)
+    disk = get_disk_path(node)
+    qemu_raw(disk, netif=get_node_tap(node), output_to=(None if kill_path is None else "log.%s.launch" % node.hostname), kill_path=kill_path)
+
+
+def qemu_scan_ssh(node_name, kill_path=None):
+    node = configuration.get_config().get_node(node_name)
+    disk = get_disk_path(node)
+
+    fingerprints = []
+    def scan_next(line: bytes):
+        if b"SHA256" in line and b" root@temporary-hostname (" in line:
+            # TODO: don't just arbitrarily replace the string; parse and do a better conversion (for robustness)
+            fingerprints.append(line.strip().decode().replace(" root@temporary-hostname ", " no comment "))
+        elif fingerprints and not line.strip():
+            access.pull_supervisor_key(fingerprints)
+            return True
+
+    qemu_raw(disk, netif=get_node_tap(node), output_callback=scan_next, kill_path=kill_path)
+
+
+def qemu_wait_for(alive_path):
+    notify = time.time()
+    last_len = 0
+    while not os.path.exists(alive_path):
+        message = "waited for server startup for %d seconds" % round(time.time() - notify)
+        print(message.ljust(last_len, " "), end="\r")
+        time.sleep(1)
+        last_len = len(message)
+    print("server found".ljust(last_len, " "))
+
+
+def qemu_check_nested_virt():
+    if util.readfile("/sys/module/kvm_intel/parameters/nested").strip() != b"Y":
+        command.fail("nested virtualization not enabled")
+
+
+main_command = seq.seq_mux_map("commands to run local testing VMs", {
     "net": command.mux_map("commands to control the state of the local testing network", {
         "up": command.wrap("bring up local testing network", net_up),
         "down": command.wrap("bring down local testing network", net_down),
+    }),
+    "qemu": command.mux_map("commands to launch local qemu instances", {
+        "install": command.wrap("launch a qemu installation", qemu_install),
+        "launch": command.wrap("launch an already-installed qemu instance", qemu_launch),
+        "scan-ssh": command.wrap("launch an already-installed qemu instance and update known_hosts based on the printed fingerprint", qemu_scan_ssh),
+        "wait-for": command.wrap("wait for scan-ssh to finish getting keys from a node", qemu_wait_for),
+        "raw": command.wrap("launch a qemu instance directly, for debugging", qemu_raw),
+        "check-nested-virt": command.wrap("check that nested virtualization is available", qemu_check_nested_virt)
     }),
 })
