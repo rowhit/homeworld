@@ -10,7 +10,10 @@ import access
 import command
 import configuration
 import infra
+import iso
 import seq
+import setup
+import util
 
 
 def get_bridge(ip):
@@ -324,6 +327,80 @@ def qemu_check_nested_virt():
         command.fail("nested virtualization not enabled")
 
 
+def auto_supervisor(ops: setup.Operations, install_iso, disk_gb=25, kill_file=None):
+    config = configuration.get_config()
+    supervisor = config.keyserver
+    ops.add_operation("install supervisor node (this may take several minutes)",
+                      lambda: qemu_install(supervisor.hostname, install_iso, "manual", disk_gb, "hide"),
+                      supervisor)
+    # TODO: better scoping for this file
+    alive = os.path.join(configuration.get_project(), "supervisor.live.%d" % os.getpid())
+    if kill_file is None:
+        kill = os.path.join(configuration.get_project(), "supervisor.kill.%d" % os.getpid())
+    else:
+        kill = kill_file
+    # TODO: annotations, so that this can be --dry-run'd
+    ops.add_operation("start up supervisor node", lambda: qemu_scan_ssh(supervisor.hostname, kill_path=kill))
+    ops.add_subcommand(seq.sequence_supervisor)
+    if kill_file is None:
+        def wait_for_stopped():
+            util.writefile(kill, b"stop\n")
+            # TODO: don't busywait
+            while os.path.exists(kill):
+                time.sleep(0.1)
+        ops.add_operation("stop supervisor node", wait_for_stopped)
+
+
+def auto_node(ops: setup.Operations, node: configuration.Node, install_iso, disk_gb=25, kill_file=None):
+    ops.add_operation("install node @HOST (this may take several minutes)",
+                      lambda: qemu_install(node.hostname, install_iso, "auto-admit", disk_gb, "hide"),
+                      node)
+    if kill_file is None:
+        kill = os.path.join(configuration.get_project(), "node-%s.kill.%d" % (node.hostname, os.getpid()))
+    else:
+        kill = kill_file
+    ops.add_operation("start up node @HOST", lambda: qemu_launch(node.hostname, kill_path=kill), node)
+    if kill_file is None:
+        def wait_for_stopped():
+            util.writefile(kill, b"stop\n")
+            # TODO: don't busywait
+            while os.path.exists(kill):
+                time.sleep(0.1)
+        ops.add_operation("stop supervisor node", wait_for_stopped)
+
+
+def auto_cluster(ops: setup.Operations, authorized_key=None):
+    if authorized_key is None:
+        # TODO: handle HOME being unset
+        authorized_key = os.path.join(os.getenv("HOME"), ".ssh/id_rsa.pub")
+    project, config = configuration.get_project(), configuration.get_config()
+    iso_path = os.path.join(project, "cluster-%d.iso" % os.getpid())
+    ops.add_operation("check nested virtualization", qemu_check_nested_virt)
+    ops.add_operation("update known hosts", access.update_known_hosts)
+    ops.add_operation("generate ISO", lambda: iso.gen_iso(iso_path, authorized_key, "serial"))
+    ops.add_operation("set up networking", net_up)
+
+    kill_paths = {node: os.path.join(project, "node-%s.kill.%d" % (node.hostname, os.getpid()))
+                    for node in config.nodes}
+
+    ops.add_subcommand(lambda ops: auto_supervisor(ops, iso_path, kill_file=kill_paths[config.keyserver]))
+    for node in config.nodes:
+        if node == config.keyserver: continue
+        ops.add_subcommand(lambda ops, n=node: auto_node(ops, n, iso_path, kill_file=kill_paths[n]))
+
+    ops.add_subcommand(seq.sequence_cluster)
+
+    def wait_for_stopped():
+        for path in kill_paths.values():
+            util.writefile(path, b"stop\n")
+        for path in kill_paths.values():
+            # TODO: don't busywait
+            while os.path.exists(path):
+                time.sleep(0.1)
+    ops.add_operation("stop cluster nodes", wait_for_stopped)
+    ops.add_operation("tear down networking", net_down)
+
+
 main_command = seq.seq_mux_map("commands to run local testing VMs", {
     "net": command.mux_map("commands to control the state of the local testing network", {
         "up": command.wrap("bring up local testing network", net_up),
@@ -336,5 +413,9 @@ main_command = seq.seq_mux_map("commands to run local testing VMs", {
         "wait-for": command.wrap("wait for scan-ssh to finish getting keys from a node", qemu_wait_for),
         "raw": command.wrap("launch a qemu instance directly, for debugging", qemu_raw),
         "check-nested-virt": command.wrap("check that nested virtualization is available", qemu_check_nested_virt)
+    }),
+    "auto": seq.seq_mux_map("commands to perform large-scale operations automatically", {
+        "supervisor": seq.wrapseq("completely install and configure the supervisor node", auto_supervisor),
+        "cluster": seq.wrapseq("complete cluster installation", auto_cluster),
     }),
 })
